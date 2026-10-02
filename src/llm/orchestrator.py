@@ -5,26 +5,25 @@ Fallback chain design: try each configured tier in order; a tier is
 SKIPPED (not retried) if its API key isn't set, and FALLS THROUGH to the
 next tier if it's rate limited, erroring, or exhausts its retries.
 
-Free-tier reality check (learned via live testing on this project):
-  - Gemini Flash (gemini-3.6-flash, this account's only available free
-    model) failed 100% of attempts (5/5 retries exhausted) on every
-    single call, regardless of pacing -- pointing to an account-level
-    quota of effectively zero, not a timing problem retries could fix.
-    It has been REMOVED from the active chain below (see commented tier)
-    since every attempt cost ~25s before falling through, actively
-    slowing the pipeline for zero benefit.
-  - Groq's free tier does work, but enforces a real DAILY request cap
-    (~1,000 req/day per model) on top of its per-minute limit -- once
-    near that cap, Retry-After values of 100-350+ seconds are normal and
-    expected, not a bug. The retry/backoff logic here respects those
-    values exactly rather than guessing, so it recovers correctly, just
-    slowly, once the daily quota partially resets.
-  - DeepSeek via OpenRouter was configured but never had a key set in
-    this project's testing; it remains in the chain as a genuine third
-    option for anyone who does configure OPENROUTER_API_KEY.
+CRITICAL FIX (added after live testing): when a provider's daily quota is
+exhausted, it reports 429s with a very long Retry-After (observed:
+100-450+ seconds on Groq's free tier). The retry loop used to sleep
+through up to 5 such waits on the SAME tier before ever falling through
+to the next one -- meaning a chain with 3 configured tiers could spend
+20+ minutes stuck on tier 1 alone, defeating the entire point of having
+a fallback chain. Fixed via `giveup_if_delay_exceeds` in
+src/utils/retry.py: any wait longer than 30s now gives up on that tier
+IMMEDIATELY so the next tier is tried within seconds, not minutes. Short
+waits (a few seconds, typical of normal per-minute rate limiting) still
+retry normally within the tier.
 
-Every request is pre-truncated (chunking.py) to guarantee no 413s
-regardless of which tier ends up serving it.
+Free-tier reality check (learned via live testing on this project):
+  - Gemini Flash failed 100% of attempts regardless of pacing -- removed
+    from the active chain entirely (see commented-out tier below).
+  - Groq's free tier enforces a real DAILY request cap (~1,000 req/day
+    per model) on top of its per-minute limit.
+  - DeepSeek via OpenRouter is configured as the third tier and engages
+    properly now that the fast-fallthrough fix is in place.
 """
 
 from __future__ import annotations
@@ -53,7 +52,6 @@ class LLMTier:
     extra_headers: Optional[Dict[str, str]] = None
 
 
-# Order matters: this IS the fallback chain.
 DEFAULT_CHAIN: List[LLMTier] = [
     LLMTier(
         name="Groq GPT-OSS-20B",
@@ -61,11 +59,7 @@ DEFAULT_CHAIN: List[LLMTier] = [
         model="openai/gpt-oss-20b",
         api_key_env="GROQ_API_KEY",
     ),
-    # Gemini Flash intentionally excluded from the active chain -- see
-    # module docstring above. Left here, commented, as a record of what
-    # was tried and why it was removed, and so it's trivial to re-enable
-    # for a different account/billing tier:
-    #
+    # Gemini Flash intentionally excluded -- see module docstring above.
     # LLMTier(
     #     name="Gemini Flash",
     #     base_url="https://generativelanguage.googleapis.com/v1beta/chat/completions",
@@ -94,11 +88,6 @@ class LLMOrchestrator:
     ):
         self.session = session
         self.chain = chain or DEFAULT_CHAIN
-        # A single global semaphore + minimum spacing between calls (across
-        # ALL tiers, not per-tier) keeps aggregate request rate predictable
-        # regardless of how many extractions are logically "concurrent".
-        # 3.0s is tuned for Groq's per-minute limit now that Gemini (which
-        # needed much more conservative pacing) is out of the active chain.
         self.call_sem = asyncio.Semaphore(1)
         self.min_call_interval = min_call_interval
 
@@ -139,7 +128,14 @@ class LLMOrchestrator:
                 data = await resp.json()
                 return data["choices"][0]["message"]["content"]
 
-        return await with_retries(_do_call, op_name=tier.name, max_attempts=5, base_delay=3.0)
+        # giveup_if_delay_exceeds=30: a rate-limit wait longer than 30s
+        # means this tier is effectively unusable right now (daily quota,
+        # not a normal per-minute limit) -- give up on it immediately so
+        # the chain falls through to the next tier within seconds.
+        return await with_retries(
+            _do_call, op_name=tier.name, max_attempts=5, base_delay=3.0,
+            giveup_if_delay_exceeds=30.0,
+        )
 
     async def extract_json(
         self, system_prompt: str, user_content: str, max_input_chars: int = 6000
@@ -147,7 +143,8 @@ class LLMOrchestrator:
         """
         Runs `user_content` through the fallback chain and returns parsed
         JSON. Tries each tier in order; falls through to the next tier on
-        any failure (missing key, exhausted retries, bad response).
+        any failure (missing key, exhausted retries, bad response, or a
+        rate-limit wait too long to be worth sitting through).
         """
         safe_content = truncate_for_llm(user_content, max_chars=max_input_chars)
 

@@ -1,14 +1,11 @@
 """
 Shared async retry/backoff utility.
 
-Used by every network-calling component in the pipeline: scrapers, the
-GitHub stars enrichment step, and the LLM orchestrator's fallback chain.
-
 Handles:
 - 429 Too Many Requests -> exponential backoff + jitter, honors Retry-After
 - 5xx transient errors -> retry
 - 413 Payload Too Large -> NOT retried here (that's a payload problem, not
-  a transient one — see llm/chunking.py for the fix)
+  a transient one -- see llm/chunking.py for the fix)
 """
 
 from __future__ import annotations
@@ -45,14 +42,20 @@ async def with_retries(
     max_delay: float = 60.0,
     jitter: float = 0.5,
     op_name: str = "operation",
+    giveup_if_delay_exceeds: Optional[float] = None,
 ) -> T:
     """
     Runs `fn` with exponential backoff + jitter on RetryableError,
     aiohttp.ClientError, and asyncio.TimeoutError.
 
-    Backoff formula: min(max_delay, base_delay * 2^attempt) + random jitter.
-    If the error carries a Retry-After (429 responses), that value is
-    respected instead of the computed backoff.
+    `giveup_if_delay_exceeds`: if set, and the computed/requested delay
+    for a retry would exceed this many seconds, give up on this tier
+    IMMEDIATELY instead of sleeping through it. This matters for
+    fallback chains: a provider reporting a daily-quota exhaustion via a
+    huge Retry-After (e.g. 300+ seconds) should be treated as "unusable
+    right now" so the caller can fall through to the next tier quickly,
+    rather than the chain wasting minutes waiting on a single dead tier
+    before ever trying the alternative that would have worked instantly.
     """
     attempt = 0
     while True:
@@ -60,10 +63,15 @@ async def with_retries(
             return await fn()
         except RetryableError as e:
             attempt += 1
+            delay = e.retry_after if e.retry_after else min(max_delay, base_delay * (2 ** attempt))
+            if giveup_if_delay_exceeds is not None and delay > giveup_if_delay_exceeds:
+                logger.warning(f"[{op_name}] retry delay {delay:.0f}s exceeds "
+                                f"{giveup_if_delay_exceeds:.0f}s threshold, giving up on this "
+                                f"tier immediately (falling through instead of waiting): {e}")
+                raise
             if attempt >= max_attempts:
                 logger.error(f"[{op_name}] giving up after {attempt} attempts: {e}")
                 raise
-            delay = e.retry_after if e.retry_after else min(max_delay, base_delay * (2 ** attempt))
             delay += random.uniform(0, jitter)
             logger.warning(f"[{op_name}] retryable error (attempt {attempt}/{max_attempts}), "
                             f"sleeping {delay:.1f}s: {e}")
